@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ambient aperture terrain shader</title>
+<style>
+html, body {
+  background-color: #aaa;
+  font-family: Sans-Serif;
+}
+</style>
+<script src="webgl-utils.js"></script>
+<script>
+(function(){
+"use strict";
+
+window.onload = function main() {
+  var image = new Image();
+  image.src = "textures/hf.png";  // MUST BE SAME DOMAIN!!!
+  image.onload = function() {
+    render(image);
+  }
+}
+
+function render(image) {
+  // Get A WebGL context
+  var canvas = document.getElementById("canvas");
+  var gl = getWebGLContext(canvas);
+  if (!gl) {
+    return;
+  }
+
+  // Setup GLSL programs for rendering & lighting precompute ("baking")
+  var program = createProgramFromScripts(gl, ["2d-vertex-shader", "2d-fragment-shader"]);
+  var bakeProgram = createProgramFromScripts(gl, ["2d-vertex-shader-bake", "2d-fragment-shader-bake"]);
+  
+
+  // Look up where the vertex data needs to go.
+  var positionLocation = gl.getAttribLocation(program, "a_position");
+
+  // Create a buffer and put a single clipspace rectangle in
+  // it (2 triangles)
+  var buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1.0, -1.0,
+     1.0, -1.0,
+    -1.0,  1.0,
+    -1.0,  1.0,
+     1.0, -1.0,
+     1.0,  1.0]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(positionLocation);
+  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+  // Create a texture for heightfield & bind it
+  var texture = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0)
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  // Upload the heightfield image into the texture.
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gl.LUMINANCE, gl.UNSIGNED_BYTE, image);
+
+  // Calculate spherical cap for each pixel in height map & render to texture
+  var fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+
+  var renderTex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1)
+  gl.bindTexture(gl.TEXTURE_2D, renderTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1024, 1024, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, renderTex, 0);
+  
+  gl.viewport(0, 0, 1024, 1024);
+
+  gl.useProgram(bakeProgram);
+
+  gl.uniform1i(gl.getUniformLocation(bakeProgram, "u_heightfield"), 0);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  
+  gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // Render shaded terrain to viewport
+  gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+  var lightTopLocation = gl.getUniformLocation(program, "u_light_top");
+  var lightBotttomLocation = gl.getUniformLocation(program, "u_light_bottom");
+  var heightfieldLocation = gl.getUniformLocation(program, "u_heightfield");
+  var apertureMapLocation = gl.getUniformLocation(program, "u_aperture_map");
+
+  gl.useProgram(program);
+
+  gl.uniform1i(heightfieldLocation, 0);
+  gl.uniform1i(apertureMapLocation, 1);
+  
+  document.getElementById("precomputing").innerText = "";
+
+  var framecount = 0.8;
+
+  draw(); 
+
+  function draw(){
+    framecount=framecount-0.01;
+
+    var light = {x:Math.sin(framecount), y:Math.cos(framecount), z:(Math.cos(framecount)+0.5)};
+    var ratio = light.z/Math.sqrt(Math.pow(light.x,2)+Math.pow(light.y,2));
+
+    // set the lights
+    gl.uniform3f(lightTopLocation, light.x, light.y, Math.tan(Math.atan(ratio)+0.1));
+    gl.uniform3f(lightBotttomLocation, light.x, light.y, Math.tan(Math.atan(ratio)-0.1));
+
+    // draw
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    window.requestAnimationFrame(draw);
+  }
+}
+})();
+</script>
+<!-- vertex shader -->
+<script id="2d-vertex-shader" type="x-shader/x-vertex">
+attribute vec2 a_position;
+varying vec2 v_position;
+
+void main() {
+   gl_Position = vec4(a_position * vec2(1, -1), 0, 1); // flip y-axis 
+   v_position = (a_position + 1.0)/2.0; // convert from clipSpace [-1, +1] to textureSpace [0, 1]
+}
+</script>
+<!-- fragment shader -->
+<script id="2d-fragment-shader" type="x-shader/x-fragment">
+precision mediump float;
+
+#define SAMPLEINTERVAL 0.001
+#define SUNANGLE 0.05
+
+uniform sampler2D u_heightfield;
+uniform sampler2D u_aperture_map;
+uniform vec3 u_light_top;
+uniform vec3 u_light_bottom;
+
+varying vec2 v_position;
+
+void main() {
+  vec3 light = normalize( (u_light_top+u_light_bottom)/2.0 );
+  
+  // Pull baked ambient aperture vector & area
+  vec4 baked = texture2D(u_aperture_map, v_position);
+  vec3 skyLight = baked.xyz*2.0-1.0;
+
+  // calculate overlap between "cones"
+  float apertureAngle = acos(1.0-baked.a)*2.0;
+  float angleDelta = acos( dot(skyLight, light) );
+  float sunIntensity = clamp( (apertureAngle-(angleDelta*2.0)+SUNANGLE)/(SUNANGLE*2.0) , 0.0, 1.0);
+  
+
+  
+  // Calculate surface normal
+  float h = texture2D(u_heightfield, v_position).r*0.1;
+  float x1 = texture2D(u_heightfield, v_position+vec2(SAMPLEINTERVAL, 0)).r*0.1-h;
+  float x2 = h-texture2D(u_heightfield, v_position+vec2(-SAMPLEINTERVAL, 0)).r*0.1;
+  float y1 = texture2D(u_heightfield, v_position+vec2(0, SAMPLEINTERVAL)).r*0.1-h;
+  float y2 = h-texture2D(u_heightfield, v_position+vec2(0, -SAMPLEINTERVAL)).r*0.1;
+  vec3 normal = normalize(cross( vec3(SAMPLEINTERVAL, 0, (x1+x2)/2.0), vec3(0, SAMPLEINTERVAL, (y1+y2)/2.0) ));
+
+  
+  float sunLum = sunIntensity*dot(light, normal);
+  float skyLum = baked.a*dot(skyLight, normal);
+
+  gl_FragColor = vec4(vec3(1.0,1.0,1.0)*(sunLum*0.8+skyLum*clamp(light.z+0.1, 0.0, 0.2)), 1.0);
+}
+</script>
+<!-- render to texture vertex shader -->
+<script id="2d-vertex-shader-bake" type="x-shader/x-vertex">
+attribute vec2 a_position;
+varying vec2 v_position;
+
+void main() {
+   gl_Position = vec4(a_position, 0, 1);
+   v_position = (a_position + 1.0)/2.0; // convert from clipSpace [-1, +1] to textureSpace [0, 1]
+}
+</script>
+<!-- render to texture fragment shader -->
+<script id="2d-fragment-shader-bake" type="x-shader/x-fragment">
+precision mediump float;
+
+#define SAMPLEINTERVAL 0.001
+#define NUMRAYS 16
+
+uniform sampler2D u_heightfield;
+
+varying vec2 v_position;
+
+void main() {
+
+  vec3 horizons[NUMRAYS];
+  float h = texture2D(u_heightfield, v_position).r*0.1;
+
+  for(int r = 0; r < NUMRAYS; r++){
+    float angle = float(r)*6.28318530717959/float(NUMRAYS);
+    vec2 direction = vec2(sin(angle), cos(angle));
+    float largest = 0.0;
+    for(float i=1.0; i<10000.0; i++){
+      float samplingDistance = SAMPLEINTERVAL*i;
+      if(v_position.x + (direction.x*samplingDistance) >= 1.0 || v_position.y + (direction.y*samplingDistance) >= 1.0 || v_position.x + (direction.x*samplingDistance) <= 0.0 || v_position.y + (direction.y*samplingDistance) <= 0.0){
+        break;
+      }
+
+      float sampleH = texture2D(u_heightfield, v_position + (direction.xy*samplingDistance)).r*0.1-h;
+      float ratio = sampleH/length(direction.xy*samplingDistance);
+      if(ratio > largest){
+        largest = ratio;
+      }
+    }
+    horizons[r]= normalize( vec3(direction, largest) );
+  }
+  vec3 avgVector = vec3(0.0, 0.0, 0.0);
+  float avgSkyArea = 0.0;
+  for(int r = 0; r < NUMRAYS; r++){
+    avgVector += horizons[r];
+    avgSkyArea += ( 1.0 - dot(horizons[r], vec3(0.0, 0.0, 1.0)) );
+  }
+  avgVector = normalize( avgVector/float(NUMRAYS) );
+  avgSkyArea = avgSkyArea/float(NUMRAYS);
+
+  gl_FragColor = vec4((avgVector.xyz+1.0)/2.0, avgSkyArea);//vec4(1.0-texture2D(u_heightfield, v_position).rg, 1.0, 1.0);
+}
+</script>
+</head>
+<body>
+<div id="precomputing">Precomputing lighting...</div>
+<canvas id="canvas" width="1024" height="1024"></canvas>
+</body>
+</html>
+
